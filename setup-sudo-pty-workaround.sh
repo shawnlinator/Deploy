@@ -89,7 +89,6 @@ install_sudoers_dropin() {
     local visudo tmp
     visudo=$(find_visudo)
     tmp=$(mktemp)
-    trap 'rm -f "$tmp"' RETURN
     cat > "$tmp" <<'SUDOERS_EOF'
 Defaults timestamp_type=global
 Defaults timestamp_timeout=20
@@ -100,6 +99,7 @@ SUDOERS_EOF
 
     log "installing $SUDOERS_DEST (requires sudo password)"
     sudo install -m 0440 -o root -g root "$tmp" "$SUDOERS_DEST"
+    rm -f "$tmp"
 
     log "re-validating full sudoers config after install ..."
     if ! sudo "$visudo" -c; then
