@@ -70,44 +70,47 @@ sure there's no plaintext secret sitting on disk for it to find in the first pla
 Running OpenBao itself in a container raises the same "don't let secrets touch disk"
 question one layer down — this time about process memory and swap, not files.
 
-- **Grant `mlock` instead of disabling it.** OpenBao (like Vault) calls `mlock()` to keep its
-  own secret-holding memory pages from ever being swapped to disk. Docker doesn't grant the
-  needed capability by default, so add it explicitly, along with raising the locked-memory
-  ulimit (Docker's default is too low for mlock to succeed even with the capability):
-  ```
-  docker run --cap-add=IPC_LOCK --ulimit memlock=-1:-1 ...
-  ```
-  Leave `disable_mlock = false` (the default) when this is in place.
-
-- **Known caveat with Integrated Storage (Raft).** A single-host self-hosted deployment
-  will likely use Raft (no external Consul) as the storage backend. Raft's storage engine
-  (bbolt) mmaps its entire database file, and mlock forces that whole mmap into physical RAM
-  immediately — memory usage grows with the secrets DB, not with what's actively in use. Load-
-  test with realistic data volume before relying on this in production.
+- **`mlock` is gone — verified against a running container, not just docs.** OpenBao dropped
+  `mlock` support entirely as of 2.6.x; a live `openbao/openbao:2.6.2` container refuses to
+  start if `disable_mlock` is set at all, in either direction, and errors with "OpenBao has
+  dropped support for mlock ... disable or encrypt swap instead." So `CAP_IPC_LOCK` and a
+  raised `memlock` ulimit — this plan's original mitigation — buy nothing on current versions;
+  don't bother granting the capability. Swap has to be handled entirely at the container/host
+  level now, which is what the next point does.
 
 - **Decision: deny the OpenBao container swap entirely via cgroups, rather than encrypting
   host swap.** Swap isn't namespaced per container — `swapon` registers a device/file for the
   whole host, shared by every container — so there's no way to give just OpenBao its own
   encrypted swap volume. Setting the cgroup swap limit equal to the memory limit removes the
   question instead of mitigating it: there's no swap for this container to use, encrypted or
-  not.
+  not. In `docker-compose.yml` ([openbao/docker-compose.yml](openbao/docker-compose.yml)):
+  ```yaml
+  cap_drop: ["ALL"]        # no capabilities needed now that mlock is gone
+  mem_limit: 1g
+  memswap_limit: 1g        # equal to mem_limit => zero swap headroom
   ```
-  docker run --cap-add=IPC_LOCK --ulimit memlock=-1:-1 --memory=1g --memory-swap=1g ...
-  ```
-  - `--memory-swap` equal to `--memory` gives the container's cgroup zero swap headroom. If
-    it exceeds the memory limit it gets OOM-killed rather than swapped — the right failure
-    mode for a secrets-manager container, and it backstops `mlock` structurally even if
-    `IPC_LOCK` couldn't be granted for some reason (`disable_mlock = true` fallback), since
-    the cgroup limit blocks swap regardless of whether OpenBao itself ever calls `mlock()`.
-  - Size `--memory` for worst-case, not steady-state: combined with the Raft/mmap caveat
-    above, the whole secrets DB gets pulled into resident memory and there's no swap left as
-    slack if it grows past the limit — it gets killed, not degraded. Size the limit against
-    projected data volume with headroom, and monitor container memory usage as the vault's
-    contents grow.
+  Verified live: `docker inspect openbao` shows `Memory=1073741824
+  MemorySwap=1073741824` after `docker compose up`, and the container starts and serves
+  `/v1/sys/health` cleanly with `cap_drop: ALL` and no added capabilities.
+  - Equal `mem_limit`/`memswap_limit` means the container gets OOM-killed rather than
+    swapped if it exceeds the limit — the right failure mode for a secrets-manager container.
+  - Size `mem_limit` for worst-case, not steady-state: Raft's storage engine (bbolt) mmaps
+    its entire database file, and with mlock gone there's no guarantee those pages stay
+    resident, but there's also no swap for them to spill into if the container grows past the
+    limit — it gets killed, not degraded. Size against projected data volume with headroom,
+    and monitor container memory usage as the vault's contents grow.
   - This makes host-level swap encryption unnecessary *for this container* — OpenBao simply
     never touches host swap. Encrypting host swap is still worth doing independently if other
     processes on the same host handle sensitive data, but it's no longer this plan's control
     for OpenBao specifically.
+
+- **Rootless Docker hosts: don't bother trying to raise `memlock` ulimits.** Moot now that
+  mlock is gone, but worth remembering for other containers: on a rootless Docker host, a
+  container can't set a `memlock` ulimit above the host's own hard limit for that user
+  (`ulimit -l`) — asking for `-1` (unlimited) fails with `error setting rlimits for ready
+  process: ... operation not permitted`, confirmed hitting this locally. Raising it requires
+  host-level config (`/etc/security/limits.conf` or a systemd user unit's `LimitMEMLOCK=`),
+  not anything settable from `docker-compose.yml`.
 
 ## Bottom line
 
