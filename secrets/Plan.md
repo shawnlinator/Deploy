@@ -112,10 +112,111 @@ question one layer down — this time about process memory and swap, not files.
   host-level config (`/etc/security/limits.conf` or a systemd user unit's `LimitMEMLOCK=`),
   not anything settable from `docker-compose.yml`.
 
+## Implementation notes: TPM-gated auto-unseal (PKCS#11)
+
+Default OpenBao ships with Shamir seal: every container start (reboot, crash, or even a
+`docker compose up -d` that recreates the container for an unrelated config change) comes back
+`sealed: true`, and nothing un-seals it without a human running
+`bao operator unseal` with key shares. This host also has a boot-time constraint (below) that
+means an unattended reboot leaves the whole stack down until someone does that by hand.
+
+**Chose TPM via PKCS#11 over the alternatives, after actually comparing them:**
+- Cloud KMS (AWS/GCP/Azure/OCI/etc.) — ruled out: adds a cloud dependency this deployment
+  otherwise avoids entirely.
+- Transit seal / KMIP (a second OpenBao/Vault or KMIP server holds the key) — doesn't remove
+  the bootstrap problem, only relocates it: that second system still needs to be trusted/unsealed
+  by *something*, at some point.
+- Static key seal — explicitly documented as only appropriate "when an existing source of
+  trust... already exists"; we don't have one, OpenBao *is* the secrets manager here, so this
+  would just be a plaintext key in a file/env var for anything to read. The exact anti-pattern
+  this whole plan exists to avoid.
+- PKCS#11 (HSM or TPM) is the only option that actually closes the loop while staying
+  self-hosted: a piece of hardware releases the key based on physical possession of *this*
+  machine, no second system to bootstrap trust into. TPM is the free instance of this category
+  (already virtualizable under Proxmox) vs. buying a real HSM (Nitrokey/Utimaco/YubiHSM).
+
+**This is TPM-*gated*, not TPM-*backed*.** No native TPM2 auto-unseal exists in OpenBao
+([openbao/openbao#1200](https://github.com/openbao/openbao/issues/1200), open, no ETA — maintainers
+want it built into their `go-kms-wrapping` fork rather than adopt an external wrapper). The
+only real unseal-key store is `seal "pkcs11"`. So the actual chain is:
+- **SoftHSM2** holds the real AES-256 key OpenBao unseals with (`openbao-unseal-key`, in a
+  token on the persistent `softhsm-tokens` volume). This is a *software* HSM — the TPM does
+  not directly hold the seal key.
+- The TPM only seals SoftHSM's *login PIN* (`/openbao/tpm/pin.pub` + `pin.priv`, safe to leave
+  as plaintext files on disk — useless without this exact machine's TPM to unseal them).
+- `entrypoint-tpm.sh` runs on every container start, before `bao server`: `tpm2_createprimary`
+  → `tpm2_load` → `tpm2_unseal` reconstructs the PIN, exports it as `BAO_HSM_PIN` (never
+  written to disk), then execs `bao server`. If the vTPM is missing, migrated, or this isn't
+  the same machine, `tpm2_unseal` fails and startup aborts here — that's the actual
+  hardware-binding guarantee.
+
+**Blockers hit and resolved, in order (all verified against the live container, not assumed):**
+1. **This VM (Proxmox VMID 101) had a `tpmstate0` device in its config but no `/dev/tpm0`
+   inside the guest.** TPM devices aren't hot-pluggable in Proxmox/QEMU — a `qm set` adding one
+   doesn't attach it to an already-running QEMU process. Required a full **stop+start at the
+   hypervisor level** (not a guest-level reboot, which just resets the same QEMU instance).
+   After that, `/dev/tpm0` and `/dev/tpmrm0` appeared immediately.
+2. **`openbao/openbao:2.6.2`'s standard Docker Hub image has PKCS#11 compiled out** —
+   confirmed live: `Error configuring seal "pkcs11": this build of OpenBao has PKCS#11
+   disabled`. PKCS#11 requires the separate `openbao-hsm_*` release build, which is
+   **glibc/cgo-linked** (confirmed via `ldd`: `/lib64/ld-linux-x86-64.so.2`, `libc.so.6` — won't
+   run on the standard image's Alpine/musl base). Fetched the `-hsm` binary from the GitHub
+   release, **verified its SHA-256 against the published `checksums.txt`** before using it, and
+   rebuilt the image from `debian:bookworm-slim` instead of Alpine.
+3. **Alpine's `tpm2-tools` package doesn't pull in `tpm2-tss-tcti-device`** — without it,
+   `tctildr` can't dlopen a backend for `device:/dev/tpm*` at all (fails with "Failed to
+   instantiate TCTI" even though the raw device opens fine and permissions are correct). Moot
+   after switching to Debian, whose `tpm2-tools` package pulls `libtss2-tcti-device0` in
+   automatically — but cost an aborted SoftHSM token (see next point) before the switch.
+4. **Device access via supplementary groups, not root/capabilities.** `/dev/tpm0` is group
+   `root` (gid 0), `/dev/tpmrm0` is group `tss` (gid 105 on this host — confirm with
+   `getent group tss` elsewhere). `group_add: ["0", "105"]` on the (still non-root,
+   `cap_drop: ALL`) container grants both via normal DAC group-permission checks — no
+   capabilities or root needed at any point.
+5. **Named-volume ownership follows whatever owns that path in the image at first mount.**
+   Hit this twice: once for `softhsm-tokens` (seeded root:root since nothing pre-created
+   `/var/lib/softhsm/tokens` in the image — fixed by `mkdir`+`chown` to the `openbao` user in
+   the Dockerfile before that path becomes a volume mount point), and once for
+   `openbao-data`/`openbao-logs` (seeded under Alpine's `openbao` uid 100, then unreadable by
+   Debian image's `openbao` uid 1000 after the base-image switch — `permission denied` on
+   `vault.db`). Both times the fix was deleting the volume and letting Docker reseed it from
+   the corrected image, safe here only because nothing had been initialized into Raft yet.
+6. **SoftHSM token version drift across the Alpine→Debian switch.** Alpine shipped SoftHSM
+   2.7.0, Debian bookworm ships 2.6.1. Rather than risk an undocumented forward-compatibility
+   gap in the on-disk token format, wiped and fully re-ran provisioning (fresh PIN, fresh
+   token, fresh AES key, fresh TPM seal) once on the final Debian image, instead of trying to
+   carry the Alpine-provisioned token over.
+
+**Provisioning (one-time, already done for this deployment):** SoftHSM token init +
+`pkcs11-tool --keygen --key-type aes:32` for the AES-256 seal key, then
+`tpm2_createprimary`/`tpm2_create -i -` sealing a freshly-generated random PIN to the TPM. The
+PIN was generated and consumed entirely within one script's shell variables — no print/log/file
+ever held it in plaintext, and the round-trip (`tpm2_load` + `tpm2_unseal` reproducing the
+exact same PIN) was verified before trusting it. The SO-PIN used only for that one-time
+provisioning was discarded on purpose — not needed again unless the token is re-provisioned
+from scratch.
+
+**Still a human step, unavoidably:** the very first `bao operator init` on this newly-emptied
+Raft storage must still be run by a human with API/exec access (produces recovery keys +
+initial root token, and this is the one place those values exist — they should never pass
+through an assistant's context, same reasoning as the original root token). After that one-time
+init, PKCS#11/TPM auto-unseal handles every subsequent restart with zero human involvement,
+*except* two hard dependencies that don't have a purely-software fix:
+- Host reboot must be registered in `~/Programs/start_docker_containers`'s `SERVICES` array
+  (this host restores `unless-stopped`/`always` containers immediately on dockerd start, before
+  its staggered-boot script — `~/Programs/staggered-startup.sh` — gets a chance to pace things;
+  that staggering exists because of a prior VM-freezing incident. `openbao` and `comet-bao`
+  are both now `restart: on-failure:5` and registered in that array).
+- The vTPM itself must survive a hypervisor-level stop/start of VMID 101 intact and
+  un-migrated — that's the actual security property being relied on, not a config detail to
+  route around.
+
 ## Bottom line
 
 Steps 2–4 (vault-backed injection + short-lived credentials + keeping resolution out of the
 agent's context) are the only measures that structurally remove the assistant from the trust
 boundary. Steps 1, 6, and 7 reduce accidental exposure but don't hold up against anything
 adversarial or against the assistant's own shell access — plan accordingly for what actually
-gets deployed here.
+gets deployed here. The TPM auto-unseal work above extends the same principle one layer down:
+the seal key material is provisioned once by automation and then never seen again by anything,
+human or assistant — only released by a machine that can prove it *is* this exact host.
